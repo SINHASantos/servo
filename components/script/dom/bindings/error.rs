@@ -4,34 +4,32 @@
 
 //! Utilities to throw exceptions from Rust bindings.
 
+use std::slice::from_raw_parts;
+
+#[cfg(feature = "js_backtrace")]
+use backtrace::Backtrace;
+use js::error::{throw_range_error, throw_type_error};
+#[cfg(feature = "js_backtrace")]
+use js::jsapi::StackFormat as JSStackFormat;
+use js::jsapi::{
+    ExceptionStackBehavior, JSContext, JS_ClearPendingException, JS_IsExceptionPending,
+};
+use js::jsval::UndefinedValue;
+use js::rust::wrappers::{JS_ErrorFromException, JS_GetPendingException, JS_SetPendingException};
+use js::rust::{HandleObject, HandleValue, MutableHandleValue};
+use libc::c_uint;
+
 #[cfg(feature = "js_backtrace")]
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::PrototypeList::proto_id_to_name;
-use crate::dom::bindings::conversions::root_from_object;
 use crate::dom::bindings::conversions::{
-    ConversionResult, FromJSValConvertible, ToJSValConvertible,
+    root_from_object, ConversionResult, FromJSValConvertible, ToJSValConvertible,
 };
 use crate::dom::bindings::str::USVString;
 use crate::dom::domexception::{DOMErrorName, DOMException};
 use crate::dom::globalscope::GlobalScope;
 use crate::realms::InRealm;
 use crate::script_runtime::JSContext as SafeJSContext;
-#[cfg(feature = "js_backtrace")]
-use backtrace::Backtrace;
-use js::error::{throw_range_error, throw_type_error};
-use js::jsapi::ExceptionStackBehavior;
-use js::jsapi::JSContext;
-use js::jsapi::JS_ClearPendingException;
-use js::jsapi::JS_IsExceptionPending;
-#[cfg(feature = "js_backtrace")]
-use js::jsapi::StackFormat as JSStackFormat;
-use js::jsval::UndefinedValue;
-use js::rust::wrappers::JS_ErrorFromException;
-use js::rust::wrappers::JS_GetPendingException;
-use js::rust::wrappers::JS_SetPendingException;
-use js::rust::{HandleObject, HandleValue, MutableHandleValue};
-use libc::c_uint;
-use std::slice::from_raw_parts;
 
 #[cfg(feature = "js_backtrace")]
 thread_local! {
@@ -309,6 +307,12 @@ pub unsafe fn throw_invalid_this(cx: *mut JSContext, proto_id: u16) {
         "\"this\" object does not implement interface {}.",
         proto_id_to_name(proto_id)
     );
+    throw_type_error(cx, &error);
+}
+
+pub unsafe fn throw_constructor_without_new(cx: *mut JSContext, name: &str) {
+    debug_assert!(!JS_IsExceptionPending(cx));
+    let error = format!("{} constructor: 'new' is required", name);
     throw_type_error(cx, &error);
 }
 

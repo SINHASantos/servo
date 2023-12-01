@@ -2,9 +2,22 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-#![deny(missing_docs)]
-
 //! The set of animations for a document.
+
+use std::cell::Cell;
+
+use cssparser::ToCss;
+use fxhash::{FxHashMap, FxHashSet};
+use libc::c_void;
+use msg::constellation_msg::PipelineId;
+use script_traits::{AnimationState as AnimationsPresentState, ScriptMsg, UntrustedNodeAddress};
+use serde::{Deserialize, Serialize};
+use style::animation::{
+    Animation, AnimationSetKey, AnimationState, DocumentAnimationSet, ElementAnimationSet,
+    KeyframesIterationState, Transition,
+};
+use style::dom::OpaqueNode;
+use style::selector_parser::PseudoElement;
 
 use crate::dom::animationevent::AnimationEvent;
 use crate::dom::bindings::cell::DomRefCell;
@@ -15,38 +28,33 @@ use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
+use crate::dom::bindings::trace::NoTrace;
 use crate::dom::event::Event;
 use crate::dom::node::{from_untrusted_node_address, window_from_node, Node, NodeDamage};
 use crate::dom::transitionevent::TransitionEvent;
 use crate::dom::window::Window;
-use cssparser::ToCss;
-use fxhash::{FxHashMap, FxHashSet};
-use libc::c_void;
-use msg::constellation_msg::PipelineId;
-use script_traits::{AnimationState as AnimationsPresentState, ScriptMsg, UntrustedNodeAddress};
-use std::cell::Cell;
-use style::animation::{
-    Animation, AnimationSetKey, AnimationState, DocumentAnimationSet, ElementAnimationSet,
-    KeyframesIterationState, Transition,
-};
-use style::dom::OpaqueNode;
-use style::selector_parser::PseudoElement;
 
 /// The set of animations for a document.
 #[derive(Default, JSTraceable, MallocSizeOf)]
-#[unrooted_must_root_lint::must_root]
+#[crown::unrooted_must_root_lint::must_root]
 pub(crate) struct Animations {
     /// The map of nodes to their animation states.
+    #[no_trace]
     pub sets: DocumentAnimationSet,
 
     /// Whether or not we have animations that are running.
     has_running_animations: Cell<bool>,
 
     /// A list of nodes with in-progress CSS transitions or pending events.
-    rooted_nodes: DomRefCell<FxHashMap<OpaqueNode, Dom<Node>>>,
+    rooted_nodes: DomRefCell<FxHashMap<NoTrace<OpaqueNode>, Dom<Node>>>,
 
     /// A list of pending animation-related events.
     pending_events: DomRefCell<Vec<TransitionOrAnimationEvent>>,
+
+    /// The timeline value at the last time all animations were marked dirty.
+    /// This is used to prevent marking animations dirty when the timeline
+    /// has not changed.
+    timeline_value_at_last_dirty: Cell<f64>,
 }
 
 impl Animations {
@@ -56,6 +64,7 @@ impl Animations {
             has_running_animations: Cell::new(false),
             rooted_nodes: Default::default(),
             pending_events: Default::default(),
+            timeline_value_at_last_dirty: Cell::new(0.0),
         }
     }
 
@@ -65,12 +74,26 @@ impl Animations {
         self.pending_events.borrow_mut().clear();
     }
 
-    pub(crate) fn mark_animating_nodes_as_dirty(&self) {
+    // Mark all animations dirty, if they haven't been marked dirty since the
+    // specified `current_timeline_value`. Returns true if animations were marked
+    // dirty or false otherwise.
+    pub(crate) fn mark_animating_nodes_as_dirty(&self, current_timeline_value: f64) -> bool {
+        if current_timeline_value <= self.timeline_value_at_last_dirty.get() {
+            return false;
+        }
+        self.timeline_value_at_last_dirty
+            .set(current_timeline_value);
+
         let sets = self.sets.sets.read();
         let rooted_nodes = self.rooted_nodes.borrow();
-        for node in sets.keys().filter_map(|key| rooted_nodes.get(&key.node)) {
+        for node in sets
+            .keys()
+            .filter_map(|key| rooted_nodes.get(&NoTrace(key.node)))
+        {
             node.dirty(NodeDamage::NodeStyleDamaged);
         }
+
+        true
     }
 
     pub(crate) fn update_for_new_timeline_value(&self, window: &Window, now: f64) {
@@ -97,7 +120,6 @@ impl Animations {
         }
 
         self.unroot_unused_nodes(&sets);
-        //self.update_running_animations_presence(window);
     }
 
     /// Cancel animations for the given node, if any exist.
@@ -318,7 +340,7 @@ impl Animations {
         let mut rooted_nodes = self.rooted_nodes.borrow_mut();
         for (key, set) in sets.iter() {
             let opaque_node = key.node;
-            if rooted_nodes.contains_key(&opaque_node) {
+            if rooted_nodes.contains_key(&NoTrace(opaque_node)) {
                 continue;
             }
 
@@ -328,7 +350,7 @@ impl Animations {
                 let address = UntrustedNodeAddress(opaque_node.0 as *const c_void);
                 unsafe {
                     rooted_nodes.insert(
-                        opaque_node,
+                        NoTrace(opaque_node),
                         Dom::from_ref(&*from_untrusted_node_address(address)),
                     )
                 };
@@ -341,7 +363,7 @@ impl Animations {
         let pending_events = self.pending_events.borrow();
         let nodes: FxHashSet<OpaqueNode> = sets.keys().map(|key| key.node).collect();
         self.rooted_nodes.borrow_mut().retain(|node, _| {
-            nodes.contains(&node) || pending_events.iter().any(|event| event.node == *node)
+            nodes.contains(&node.0) || pending_events.iter().any(|event| event.node == node.0)
         });
     }
 
@@ -445,7 +467,7 @@ impl Animations {
         for event in events.into_iter() {
             // We root the node here to ensure that sending this event doesn't
             // unroot it as a side-effect.
-            let node = match self.rooted_nodes.borrow().get(&event.node) {
+            let node = match self.rooted_nodes.borrow().get(&NoTrace(event.node)) {
                 Some(node) => DomRoot::from_ref(&**node),
                 None => {
                     warn!("Tried to send an event for an unrooted node");
@@ -555,12 +577,15 @@ impl TransitionOrAnimationEventType {
 /// A transition or animation event.
 pub struct TransitionOrAnimationEvent {
     /// The pipeline id of the layout task that sent this message.
+    #[no_trace]
     pub pipeline_id: PipelineId,
     /// The type of transition event this should trigger.
     pub event_type: TransitionOrAnimationEventType,
     /// The address of the node which owns this transition.
+    #[no_trace]
     pub node: OpaqueNode,
     /// The pseudo element for this transition or animation, if applicable.
+    #[no_trace]
     pub pseudo_element: Option<PseudoElement>,
     /// The name of the property that is transitioning (in the case of a transition)
     /// or the name of the animation (in the case of an animation).

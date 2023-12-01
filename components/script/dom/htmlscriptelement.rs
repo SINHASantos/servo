@@ -2,50 +2,28 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use crate::document_loader::LoadType;
-use crate::dom::attr::Attr;
-use crate::dom::bindings::codegen::Bindings::DocumentBinding::DocumentMethods;
-use crate::dom::bindings::codegen::Bindings::HTMLScriptElementBinding::HTMLScriptElementMethods;
-use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
-use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::refcounted::Trusted;
-use crate::dom::bindings::reflector::DomObject;
-use crate::dom::bindings::root::{Dom, DomRoot};
-use crate::dom::bindings::settings_stack::AutoEntryScript;
-use crate::dom::bindings::str::{DOMString, USVString};
-use crate::dom::document::Document;
-use crate::dom::element::{
-    cors_setting_for_element, referrer_policy_for_element, reflect_cross_origin_attribute,
-    reflect_referrer_policy_attribute, set_cross_origin_attribute,
-};
-use crate::dom::element::{AttributeMutation, Element, ElementCreator};
-use crate::dom::event::{Event, EventBubbles, EventCancelable, EventStatus};
-use crate::dom::globalscope::GlobalScope;
-use crate::dom::htmlelement::HTMLElement;
-use crate::dom::node::{document_from_node, window_from_node};
-use crate::dom::node::{BindContext, ChildrenMutation, CloneChildrenFlag, Node};
-use crate::dom::performanceresourcetiming::InitiatorType;
-use crate::dom::virtualmethods::VirtualMethods;
-use crate::fetch::create_a_potential_cors_request;
-use crate::network_listener::{self, NetworkListener, PreInvoke, ResourceTimingListener};
-use crate::realms::enter_realm;
-use crate::script_module::fetch_inline_module_script;
-use crate::script_module::{fetch_external_module_script, ModuleOwner, ScriptFetchOptions};
-use crate::task::TaskCanceller;
-use crate::task_source::dom_manipulation::DOMManipulationTaskSource;
-use crate::task_source::TaskSource;
-use crate::task_source::TaskSourceName;
-use content_security_policy as csp;
 use core::ffi::c_void;
+use std::cell::Cell;
+use std::fs::{create_dir_all, read_to_string, File};
+use std::io::{Read, Seek, Write};
+use std::mem::replace;
+use std::path::PathBuf;
+use std::process::Command;
+use std::ptr;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+
+use content_security_policy as csp;
 use dom_struct::dom_struct;
 use encoding_rs::Encoding;
-use html5ever::{LocalName, Prefix};
+use html5ever::{local_name, namespace_url, ns, LocalName, Prefix};
 use ipc_channel::ipc;
 use ipc_channel::router::ROUTER;
 use js::jsapi::{CanCompileOffThread, CompileToStencilOffThread1, OffThreadToken};
 use js::jsval::UndefinedValue;
 use js::rust::{
-    transform_str_to_source_text, CompileOptionsWrapper, FinishOffThreadStencil, Stencil,
+    transform_str_to_source_text, CompileOptionsWrapper, FinishOffThreadStencil, HandleObject,
+    Stencil,
 };
 use msg::constellation_msg::PipelineId;
 use net_traits::request::{
@@ -57,19 +35,45 @@ use net_traits::{
 };
 use servo_atoms::Atom;
 use servo_config::pref;
-use servo_url::ImmutableOrigin;
-use servo_url::ServoUrl;
-use std::cell::Cell;
-use std::fs::{create_dir_all, read_to_string, File};
-use std::io::{Read, Seek, Write};
-use std::mem::replace;
-use std::path::PathBuf;
-use std::process::Command;
-use std::ptr;
-use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use servo_url::{ImmutableOrigin, ServoUrl};
 use style::str::{StaticStringVec, HTML_SPACE_CHARACTERS};
 use uuid::Uuid;
+
+use crate::document_loader::LoadType;
+use crate::dom::attr::Attr;
+use crate::dom::bindings::codegen::Bindings::DocumentBinding::DocumentMethods;
+use crate::dom::bindings::codegen::Bindings::HTMLScriptElementBinding::HTMLScriptElementMethods;
+use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
+use crate::dom::bindings::inheritance::Castable;
+use crate::dom::bindings::refcounted::Trusted;
+use crate::dom::bindings::reflector::DomObject;
+use crate::dom::bindings::root::{Dom, DomRoot};
+use crate::dom::bindings::settings_stack::AutoEntryScript;
+use crate::dom::bindings::str::{DOMString, USVString};
+use crate::dom::bindings::trace::NoTrace;
+use crate::dom::document::Document;
+use crate::dom::element::{
+    cors_setting_for_element, referrer_policy_for_element, reflect_cross_origin_attribute,
+    reflect_referrer_policy_attribute, set_cross_origin_attribute, AttributeMutation, Element,
+    ElementCreator,
+};
+use crate::dom::event::{Event, EventBubbles, EventCancelable, EventStatus};
+use crate::dom::globalscope::GlobalScope;
+use crate::dom::htmlelement::HTMLElement;
+use crate::dom::node::{
+    document_from_node, window_from_node, BindContext, ChildrenMutation, CloneChildrenFlag, Node,
+};
+use crate::dom::performanceresourcetiming::InitiatorType;
+use crate::dom::virtualmethods::VirtualMethods;
+use crate::fetch::create_a_potential_cors_request;
+use crate::network_listener::{self, NetworkListener, PreInvoke, ResourceTimingListener};
+use crate::realms::enter_realm;
+use crate::script_module::{
+    fetch_external_module_script, fetch_inline_module_script, ModuleOwner, ScriptFetchOptions,
+};
+use crate::task::TaskCanceller;
+use crate::task_source::dom_manipulation::DOMManipulationTaskSource;
+use crate::task_source::{TaskSource, TaskSourceName};
 
 pub struct OffThreadCompilationContext {
     script_element: Trusted<HTMLScriptElement>,
@@ -110,15 +114,15 @@ unsafe extern "C" fn off_thread_compilation_callback(
         task!(off_thread_compile_continue: move || {
             let elem = script_element.root();
             let global = elem.global();
-            let cx = global.get_cx();
+            let cx = GlobalScope::get_cx();
             let _ar = enter_realm(&*global);
 
             let compiled_script = FinishOffThreadStencil(*cx, token.0, ptr::null_mut());
 
             let load = if compiled_script.is_null() {
-                Err(NetworkError::Internal(
+                Err(NoTrace(NetworkError::Internal(
                     "Off-thread compilation failed.".into(),
-                ))
+                )))
             } else {
                 let script_text = DOMString::from(script);
                 let code = SourceCode::Compiled(CompiledSourceCode {
@@ -143,7 +147,7 @@ unsafe extern "C" fn off_thread_compilation_callback(
 
 /// An unique id for script element.
 #[derive(Clone, Copy, Debug, Eq, Hash, JSTraceable, PartialEq)]
-pub struct ScriptId(Uuid);
+pub struct ScriptId(#[no_trace] Uuid);
 
 #[dom_struct]
 pub struct HTMLScriptElement {
@@ -189,18 +193,20 @@ impl HTMLScriptElement {
         }
     }
 
-    #[allow(unrooted_must_root)]
+    #[allow(crown::unrooted_must_root)]
     pub fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
+        proto: Option<HandleObject>,
         creator: ElementCreator,
     ) -> DomRoot<HTMLScriptElement> {
-        Node::reflect_node(
+        Node::reflect_node_with_proto(
             Box::new(HTMLScriptElement::new_inherited(
                 local_name, prefix, document, creator,
             )),
             document,
+            proto,
         )
     }
 
@@ -254,6 +260,7 @@ pub enum SourceCode {
 pub struct ScriptOrigin {
     #[ignore_malloc_size_of = "Rc is hard"]
     code: SourceCode,
+    #[no_trace]
     url: ServoUrl,
     external: bool,
     fetch_options: ScriptFetchOptions,
@@ -323,7 +330,7 @@ fn finish_fetching_a_classic_script(
     document.finish_load(LoadType::Script(url));
 }
 
-pub type ScriptResult = Result<ScriptOrigin, NetworkError>;
+pub type ScriptResult = Result<ScriptOrigin, NoTrace<NetworkError>>;
 
 /// The context required for asynchronously loading an external script source.
 struct ClassicContext {
@@ -397,7 +404,7 @@ impl FetchResponseListener for ClassicContext {
                     &*self.elem.root(),
                     self.kind.clone(),
                     self.url.clone(),
-                    Err(err.clone()),
+                    Err(NoTrace(err.clone())),
                 );
                 return;
             },
@@ -418,7 +425,7 @@ impl FetchResponseListener for ClassicContext {
 
         let elem = self.elem.root();
         let global = elem.global();
-        let cx = global.get_cx();
+        let cx = GlobalScope::get_cx();
         let _ar = enter_realm(&*global);
 
         let options = unsafe { CompileOptionsWrapper::new(*cx, final_url.as_str(), 1) };
@@ -1053,7 +1060,7 @@ impl HTMLScriptElement {
         } else {
             self.line_number as u32
         };
-        rooted!(in(*window.get_cx()) let mut rval = UndefinedValue());
+        rooted!(in(*GlobalScope::get_cx()) let mut rval = UndefinedValue());
         let global = window.upcast::<GlobalScope>();
         global.evaluate_script_on_global_with_result(
             &script.code,
@@ -1108,7 +1115,7 @@ impl HTMLScriptElement {
                 .map(|record| record.handle());
 
             if let Some(record) = record {
-                rooted!(in(*global.get_cx()) let mut rval = UndefinedValue());
+                rooted!(in(*GlobalScope::get_cx()) let mut rval = UndefinedValue());
                 let evaluated =
                     module_tree.execute_module(global, record, rval.handle_mut().into());
 
@@ -1181,7 +1188,9 @@ impl HTMLScriptElement {
             (Some(ref ty), _) => {
                 debug!("script type={}", &***ty);
 
-                if &***ty == String::from("module") {
+                if ty.to_ascii_lowercase().trim_matches(HTML_SPACE_CHARACTERS) ==
+                    String::from("module")
+                {
                     return Some(ScriptType::Module);
                 }
 

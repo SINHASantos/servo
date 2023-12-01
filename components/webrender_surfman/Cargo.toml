@@ -11,7 +11,5 @@ name = "webrender_surfman"
 path = "lib.rs"
 
 [dependencies]
-euclid = "0.22"
-surfman = "0.5"
-surfman-chains = "0.7"
-
+euclid = { workspace = true }
+surfman = { workspace = true }

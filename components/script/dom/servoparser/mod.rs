@@ -2,6 +2,38 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::borrow::Cow;
+use std::cell::Cell;
+use std::mem;
+
+use base64::engine::general_purpose;
+use base64::Engine as _;
+use content_security_policy::{self as csp, CspList};
+use dom_struct::dom_struct;
+use embedder_traits::resources::{self, Resource};
+use encoding_rs::Encoding;
+use html5ever::buffer_queue::BufferQueue;
+use html5ever::tendril::fmt::UTF8;
+use html5ever::tendril::{ByteTendril, StrTendril, TendrilSink};
+use html5ever::tokenizer::TokenizerResult;
+use html5ever::tree_builder::{ElementFlags, NextParserState, NodeOrText, QuirksMode, TreeSink};
+use html5ever::{local_name, namespace_url, ns, Attribute, ExpandedName, LocalName, QualName};
+use hyper_serde::Serde;
+use mime::{self, Mime};
+use msg::constellation_msg::PipelineId;
+use net_traits::{
+    FetchMetadata, FetchResponseListener, Metadata, NetworkError, ResourceFetchTiming,
+    ResourceTimingType,
+};
+use profile_traits::time::{
+    profile, ProfilerCategory, TimerMetadata, TimerMetadataFrameType, TimerMetadataReflowType,
+};
+use script_traits::DocumentActivity;
+use servo_config::pref;
+use servo_url::ServoUrl;
+use style::context::QuirksMode as ServoQuirksMode;
+use tendril::stream::LossyDecoder;
+
 use crate::document_loader::{DocumentLoader, LoadType};
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
@@ -34,32 +66,8 @@ use crate::dom::processinginstruction::ProcessingInstruction;
 use crate::dom::text::Text;
 use crate::dom::virtualmethods::vtable_for;
 use crate::network_listener::PreInvoke;
+use crate::realms::enter_realm;
 use crate::script_thread::ScriptThread;
-use content_security_policy::{self as csp, CspList};
-use dom_struct::dom_struct;
-use embedder_traits::resources::{self, Resource};
-use encoding_rs::Encoding;
-use html5ever::buffer_queue::BufferQueue;
-use html5ever::tendril::fmt::UTF8;
-use html5ever::tendril::{ByteTendril, StrTendril, TendrilSink};
-use html5ever::tree_builder::{ElementFlags, NextParserState, NodeOrText, QuirksMode, TreeSink};
-use html5ever::{Attribute, ExpandedName, LocalName, QualName};
-use hyper_serde::Serde;
-use mime::{self, Mime};
-use msg::constellation_msg::PipelineId;
-use net_traits::{FetchMetadata, FetchResponseListener, Metadata, NetworkError};
-use net_traits::{ResourceFetchTiming, ResourceTimingType};
-use profile_traits::time::{
-    profile, ProfilerCategory, TimerMetadata, TimerMetadataFrameType, TimerMetadataReflowType,
-};
-use script_traits::DocumentActivity;
-use servo_config::pref;
-use servo_url::ServoUrl;
-use std::borrow::Cow;
-use std::cell::Cell;
-use std::mem;
-use style::context::QuirksMode as ServoQuirksMode;
-use tendril::stream::LossyDecoder;
 
 mod async_html;
 mod html;
@@ -93,9 +101,11 @@ pub struct ServoParser {
     network_decoder: DomRefCell<Option<NetworkDecoder>>,
     /// Input received from network.
     #[ignore_malloc_size_of = "Defined in html5ever"]
+    #[no_trace]
     network_input: DomRefCell<BufferQueue>,
     /// Input received from script. Used only to support document.write().
     #[ignore_malloc_size_of = "Defined in html5ever"]
+    #[no_trace]
     script_input: DomRefCell<BufferQueue>,
     /// The tokenizer of this parser.
     tokenizer: DomRefCell<Tokenizer>,
@@ -114,6 +124,7 @@ pub struct ServoParser {
     // building the DOM. https://github.com/servo/servo/pull/19203
     prefetch_tokenizer: DomRefCell<prefetch::Tokenizer>,
     #[ignore_malloc_size_of = "Defined in html5ever"]
+    #[no_trace]
     prefetch_input: DomRefCell<BufferQueue>,
 }
 
@@ -411,7 +422,7 @@ impl ServoParser {
         self.script_nesting_level() > 0 && !self.aborted.get()
     }
 
-    #[allow(unrooted_must_root)]
+    #[allow(crown::unrooted_must_root)]
     fn new_inherited(
         document: &Document,
         tokenizer: Tokenizer,
@@ -436,7 +447,7 @@ impl ServoParser {
         }
     }
 
-    #[allow(unrooted_must_root)]
+    #[allow(crown::unrooted_must_root)]
     fn new(
         document: &Document,
         tokenizer: Tokenizer,
@@ -588,7 +599,7 @@ impl ServoParser {
 
     fn tokenize<F>(&self, mut feed: F)
     where
-        F: FnMut(&mut Tokenizer) -> Result<(), DomRoot<HTMLScriptElement>>,
+        F: FnMut(&mut Tokenizer) -> TokenizerResult<DomRoot<HTMLScriptElement>>,
     {
         loop {
             assert!(!self.suspended.get());
@@ -596,8 +607,8 @@ impl ServoParser {
 
             self.document.reflow_if_reflow_timer_expired();
             let script = match feed(&mut *self.tokenizer.borrow_mut()) {
-                Ok(()) => return,
-                Err(script) => script,
+                TokenizerResult::Done => return,
+                TokenizerResult::Script(script) => script,
             };
 
             // https://html.spec.whatwg.org/multipage/#parsing-main-incdata
@@ -682,7 +693,7 @@ enum ParserKind {
 }
 
 #[derive(JSTraceable, MallocSizeOf)]
-#[unrooted_must_root_lint::must_root]
+#[crown::unrooted_must_root_lint::must_root]
 enum Tokenizer {
     Html(self::html::Tokenizer),
     AsyncHtml(self::async_html::Tokenizer),
@@ -690,7 +701,8 @@ enum Tokenizer {
 }
 
 impl Tokenizer {
-    fn feed(&mut self, input: &mut BufferQueue) -> Result<(), DomRoot<HTMLScriptElement>> {
+    #[must_use]
+    fn feed(&mut self, input: &mut BufferQueue) -> TokenizerResult<DomRoot<HTMLScriptElement>> {
         match *self {
             Tokenizer::Html(ref mut tokenizer) => tokenizer.feed(input),
             Tokenizer::AsyncHtml(ref mut tokenizer) => tokenizer.feed(input),
@@ -767,28 +779,29 @@ impl FetchResponseListener for ParserContext {
     fn process_request_eof(&mut self) {}
 
     fn process_response(&mut self, meta_result: Result<FetchMetadata, NetworkError>) {
-        let mut ssl_error = None;
-        let mut network_error = None;
-        let metadata = match meta_result {
-            Ok(meta) => Some(match meta {
-                FetchMetadata::Unfiltered(m) => m,
-                FetchMetadata::Filtered { unsafe_, .. } => unsafe_,
-            }),
-            Err(NetworkError::SslValidation(reason, cert_bytes)) => {
-                ssl_error = Some((reason, cert_bytes));
-                let mut meta = Metadata::default(self.url.clone());
-                let mime: Option<Mime> = "text/html".parse().ok();
-                meta.set_content_type(mime.as_ref());
-                Some(meta)
-            },
-            Err(NetworkError::Internal(reason)) => {
-                network_error = Some(reason);
-                let mut meta = Metadata::default(self.url.clone());
-                let mime: Option<Mime> = "text/html".parse().ok();
-                meta.set_content_type(mime.as_ref());
-                Some(meta)
-            },
-            Err(_) => None,
+        let (metadata, error) = match meta_result {
+            Ok(meta) => (
+                Some(match meta {
+                    FetchMetadata::Unfiltered(m) => m,
+                    FetchMetadata::Filtered { unsafe_, .. } => unsafe_,
+                }),
+                None,
+            ),
+            Err(error) => (
+                // Check variant without moving
+                match &error {
+                    NetworkError::SslValidation(..) |
+                    NetworkError::Internal(..) |
+                    NetworkError::Crash(..) => {
+                        let mut meta = Metadata::default(self.url.clone());
+                        let mime: Option<Mime> = "text/html".parse().ok();
+                        meta.set_content_type(mime.as_ref());
+                        Some(meta)
+                    },
+                    _ => None,
+                },
+                Some(error),
+            ),
         };
         let content_type: Option<Mime> = metadata
             .clone()
@@ -828,6 +841,8 @@ impl FetchResponseListener for ParserContext {
             return;
         }
 
+        let _realm = enter_realm(&*parser.document);
+
         parser.document.set_csp_list(csp_list);
         self.parser = Some(Trusted::new(&*parser));
         self.submit_resource_timing();
@@ -854,7 +869,7 @@ impl FetchResponseListener for ParserContext {
 
                 let doc = &parser.document;
                 let doc_body = DomRoot::upcast::<Node>(doc.GetBody().unwrap());
-                let img = HTMLImageElement::new(local_name!("img"), None, doc);
+                let img = HTMLImageElement::new(local_name!("img"), None, doc, None);
                 img.SetSrc(USVString(self.url.to_string()));
                 doc_body
                     .AppendChild(&DomRoot::upcast::<Node>(img))
@@ -867,25 +882,34 @@ impl FetchResponseListener for ParserContext {
                 parser.parse_sync();
                 parser.tokenizer.borrow_mut().set_plaintext_state();
             },
-            (mime::TEXT, mime::HTML, _) => {
-                if let Some((reason, bytes)) = ssl_error {
+            (mime::TEXT, mime::HTML, _) => match error {
+                Some(NetworkError::SslValidation(reason, bytes)) => {
                     self.is_synthesized_document = true;
                     let page = resources::read_string(Resource::BadCertHTML);
                     let page = page.replace("${reason}", &reason);
-                    let page =
-                        page.replace("${bytes}", std::str::from_utf8(&bytes).unwrap_or_default());
+                    let encoded_bytes = general_purpose::STANDARD_NO_PAD.encode(&bytes);
+                    let page = page.replace("${bytes}", encoded_bytes.as_str());
                     let page =
                         page.replace("${secret}", &net_traits::PRIVILEGED_SECRET.to_string());
                     parser.push_string_input_chunk(page);
                     parser.parse_sync();
-                }
-                if let Some(reason) = network_error {
+                },
+                Some(NetworkError::Internal(reason)) => {
                     self.is_synthesized_document = true;
                     let page = resources::read_string(Resource::NetErrorHTML);
                     let page = page.replace("${reason}", &reason);
                     parser.push_string_input_chunk(page);
                     parser.parse_sync();
-                }
+                },
+                Some(NetworkError::Crash(details)) => {
+                    self.is_synthesized_document = true;
+                    let page = resources::read_string(Resource::CrashHTML);
+                    let page = page.replace("${details}", &details);
+                    parser.push_string_input_chunk(page);
+                    parser.parse_sync();
+                },
+                Some(_) => {},
+                None => {},
             },
             (mime::TEXT, mime::XML, _) |
             (mime::APPLICATION, mime::XML, _) |
@@ -916,6 +940,7 @@ impl FetchResponseListener for ParserContext {
         if parser.aborted.get() {
             return;
         }
+        let _realm = enter_realm(&*parser);
         parser.parse_bytes_chunk(payload);
     }
 
@@ -930,6 +955,8 @@ impl FetchResponseListener for ParserContext {
         if parser.aborted.get() {
             return;
         }
+
+        let _realm = enter_realm(&*parser);
 
         match status {
             // are we throwing this away or can we use it?
@@ -996,7 +1023,7 @@ pub struct FragmentContext<'a> {
     pub form_elem: Option<&'a Node>,
 }
 
-#[allow(unrooted_must_root)]
+#[allow(crown::unrooted_must_root)]
 fn insert(
     parent: &Node,
     reference_child: Option<&Node>,
@@ -1036,8 +1063,9 @@ fn insert(
 }
 
 #[derive(JSTraceable, MallocSizeOf)]
-#[unrooted_must_root_lint::must_root]
+#[crown::unrooted_must_root_lint::must_root]
 pub struct Sink {
+    #[no_trace]
     base_url: ServoUrl,
     document: Dom<Document>,
     current_line: u64,
@@ -1058,7 +1086,7 @@ impl Sink {
     }
 }
 
-#[allow(unrooted_must_root)] // FIXME: really?
+#[allow(crown::unrooted_must_root)] // FIXME: really?
 impl TreeSink for Sink {
     type Output = Self;
     fn finish(self) -> Self {
@@ -1113,7 +1141,7 @@ impl TreeSink for Sink {
     }
 
     fn create_comment(&mut self, text: StrTendril) -> Dom<Node> {
-        let comment = Comment::new(DOMString::from(String::from(text)), &*self.document);
+        let comment = Comment::new(DOMString::from(String::from(text)), &*self.document, None);
         Dom::from_ref(comment.upcast())
     }
 
@@ -1154,13 +1182,6 @@ impl TreeSink for Sink {
 
         if let Some(control) = control {
             control.set_form_owner_from_parser(&form);
-        } else {
-            // TODO remove this code when keygen is implemented.
-            assert_eq!(
-                node.NodeName(),
-                "KEYGEN",
-                "Unknown form-associatable element"
-            );
         }
     }
 
@@ -1323,7 +1344,7 @@ fn create_element_for_token(
         CustomElementCreationMode::Asynchronous
     };
 
-    let element = Element::create(name, is, document, creator, creation_mode);
+    let element = Element::create(name, is, document, creator, creation_mode, None);
 
     // https://html.spec.whatwg.org/multipage#the-input-element:value-sanitization-algorithm-3
     // says to invoke sanitization "when an input element is first created";
@@ -1368,6 +1389,7 @@ fn create_element_for_token(
 #[derive(JSTraceable, MallocSizeOf)]
 struct NetworkDecoder {
     #[ignore_malloc_size_of = "Defined in tendril"]
+    #[custom_trace]
     decoder: LossyDecoder<NetworkSink>,
 }
 
@@ -1393,6 +1415,7 @@ impl NetworkDecoder {
 
 #[derive(Default, JSTraceable)]
 struct NetworkSink {
+    #[no_trace]
     output: StrTendril,
 }
 
